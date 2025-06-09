@@ -2,6 +2,13 @@
 
 This is a script for fixing the fake serial given to drives plugged in over a USB SATA/NVMe adapter automatically.
 
+## Usage
+
+1. git clone the repo somewhere
+
+2. Run './main --install' to create a udev rules.d file automatically based on generic usb device serials the host has seen in its logs prior to running the script.
+
+3. Plug in a familiar USB SATA adapter or dock that presents with detected generic serial numbers and the script will be called to create /dev/disk/by-id/ata- and nvme- symlinks for the drive so you can use them in your applications as if they were natively plugged with the corresponding driver.
 
 ## Why
 
@@ -19,10 +26,3 @@ Now, this will be fine if i `zpool export thePool` then `zpool import -ad /dev/d
 
 But wouldn't it have been nice if I could have used the true ata- path of the replacement disk in the first place? This script solves that problem.
 
-## Usage
-
-1. git clone the repo somewhere
-
-2. Run './main --install' to create a udev rules.d file automatically based on generic usb device serials the host has seen in its logs prior to running the script.
-
-3. Plug in a familiar USB SATA adapter or dock that presents with detected generic serial numbers and the script will be called to create /dev/disk/by-id/ata- and nvme- symlinks for the drive so you can use them in your applications as if they were natively plugged with the corresponding driver.
