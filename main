@@ -1,0 +1,335 @@
+#!/usr/bin/env python
+import argparse
+import datetime
+import glob
+import os
+import re
+import stat # Faster than pathlib
+import subprocess
+
+_scriptRoot = os.path.dirname(os.path.realpath(__file__))
+_scriptName = _scriptRoot.split('/')[-1]
+_udevFile   = "/etc/udev/rules.d/99-%s.rules" % _scriptName
+
+class Logger:
+    def __init__(self, logFile, dateFormat, dated=True, silent=False):
+        self.logFile    = logFile
+        self.dateFormat = dateFormat
+        self.dated      = dated
+        self.silent     = silent
+
+    def log(self, content):
+
+        if self.dated:
+            content = "[%s] %s" % (datetime.datetime.now().strftime(self.dateFormat), content)
+
+        if not self.silent:
+            print(content)
+
+        with open(self.logFile, 'a') as f:
+            f.write(content + '\n')
+
+def isRoot():
+    return os.geteuid() == 0
+
+def install(logger):
+    genericSerials = ['00000000', '123456', 'ABCDEF']
+
+    # Search `journalctl -t kernel` for USB devices with generic serials
+    cmd = []
+    if not isRoot():
+        cmd.append('sudo')
+
+    cmd.extend(['journalctl', '-t', 'kernel'])
+
+    result           = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    journalctlOutput = result.stdout.decode("utf-8")
+
+    usbDriveAdapters = {}
+
+    kernelUsbLines = re.finditer('^.*kernel: usb.*(Product|Manufacturer|SerialNumber):.*$', journalctlOutput, re.MULTILINE)
+
+    if kernelUsbLines:
+        for line in kernelUsbLines:
+            if 'Product:' in line.group(0):
+
+                # Reset
+                Product      = None
+                Manufacturer = None
+                SerialNumber = None
+
+                # Get the Product name
+                Product = re.findall('Product: (.*)', line.group(0))[0]
+                #print("\t%s" % Product)
+
+            elif 'Manufacturer:' in line.group(0):
+
+                # Get the Manufacturer
+                Manufacturer = re.findall('Manufacturer: (.*)', line.group(0))[0]
+                #print("\t\t%s" % Manufacturer)
+
+            elif 'SerialNumber:' in line.group(0):
+
+                # Get the Serial Number
+                SerialNumber = re.findall('SerialNumber: (.*)', line.group(0))[0]
+
+                # Check if the SerialNumber is generic and therefore relevant to this installer function
+
+                # If we have the three pieces, check if the device is a match and wipe the variables.
+                if Product and Manufacturer and SerialNumber:
+                    if any(genericSerial in SerialNumber for genericSerial in genericSerials):
+
+                        if not "%s,%s,%s" % (Product, Manufacturer, SerialNumber) in usbDriveAdapters:
+                            logger.log("Match! %s,%s,%s" % (Product, Manufacturer, SerialNumber))
+
+                            # Track the device
+                            usbDriveAdapters["%s,%s,%s" % (Product, Manufacturer, SerialNumber)] = {"Product": Product,
+                                                                                                 "Manufacturer": Manufacturer,
+                                                                                                 "SerialNumber": SerialNumber}
+
+
+                    # Reset
+                    Product      = None
+                    Manufacturer = None
+                    SerialNumber = None
+
+    if not usbDriveAdapters:
+        logger.log("Failed to find any generic looking USB device serials.")
+        logger.log("Have you plugged yours in recently?")
+        logger.log("If so, its serial may not be generic enough for this script to detect out of the box.")
+        exit(1)
+
+    baseRule = 'KERNEL=="sd[a-z]", ENV{DEVTYPE}=="disk", SUBSYSTEM=="block", ENV{ID_SERIAL_SHORT}=="%SERIAL%", RUN+="%SCRIPTROOT%/main --path %N"'
+    baseRule = baseRule.replace('%SCRIPTROOT%', _scriptRoot)
+
+    if not os.path.exists(_udevFile):
+        _udefFileContent = None
+    else:
+        with open(_udevFile, 'r') as file:
+            _udefFileContent = file.read()
+
+    with open(_udevFile, 'a') as f:
+        f.write("# %s" % str(datetime.datetime.now()) + '\n')
+
+    for usbDriveAdapter in usbDriveAdapters:
+        # Only write new udev lines if the serial isn't already in there
+        if _udefFileContent:
+            existingSearch = re.findall('"%s"' % usbDriveAdapters[usbDriveAdapter]['SerialNumber'], _udefFileContent)
+            if existingSearch:
+                logger.log("Serial %s already present in udev file. Skipping." % usbDriveAdapters[usbDriveAdapter]['SerialNumber'])
+                continue
+
+        with open(_udevFile, 'a') as f:
+            header = "# Rule for Product: %s, Manufacturer: %s, SerialNumber: %s which looks like a generic iHDD adapter serial." 
+            rule   = baseRule
+            rule   = rule.replace('%SERIAL%', usbDriveAdapters[usbDriveAdapter]['SerialNumber'])
+            f.write(header + '\n')
+            f.write(rule + '\n')
+
+    logger.log('Reloading udev rules with udevadm...')
+    udevadmReload = subprocess.run(['udevadm', 'control', '--reload-rules'])
+
+    logger.log('Done!')
+
+def evalDisk(path, logger, prefixes):
+    cmd = []
+    if not isRoot():
+        cmd.append('sudo')
+
+    cmd.extend(['smartctl', '-a', path])
+
+    result         = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    smartctlOutput = result.stdout.decode("utf-8").split('\n')
+
+    model  = None
+    serial = None
+
+    logger.log("Path:\t%s" % path)
+
+    for line in smartctlOutput:
+        if line.startswith(('Device Model:', 'Model Number:')):
+            model = line.split(':', 1)[1].strip()
+        elif line.startswith('Serial Number:'):
+            serial = line.split(':', 1)[1].strip()
+        
+        # Stop once we have both results
+        if serial and model:
+            break
+
+
+    if not serial and not model:
+        logger.log("Failed to get the serial and model for this device.")
+        exit(1)
+
+    elif not model:
+        logger.log("Failed to get the model for this device.")
+        exit(1)
+
+    elif not serial:
+        logger.log("Failed to get the model for this device.")
+        exit(1)
+
+    logger.log("model:\t%s" % model)
+    logger.log("serial:\t%s" % serial)
+
+    # Find any partitions of this device and map those too
+    partitions_glob = glob.glob(path + '*')
+
+    regex  = "^%sp?[0-9]+" % re.escape(path)
+    filter = re.compile(regex)
+
+    partitions = []
+    for partition in partitions_glob:
+        if filter.match(partition):
+            partitions.append(partition)
+
+    by_id_mappings = {}
+
+    model = model.replace(' ', '_')
+
+    for prefix in prefixes:
+        by_id_basename = "%s-%s_%s" % (prefix, model, serial)
+
+        if not path in by_id_mappings:
+            by_id_mappings[path] = []
+
+        by_id_mappings[path].append(by_id_basename)
+
+        for partition in partitions:
+            partitionNumber = re.search(r'(\d+)$', partition).group(1)
+            if not partition in by_id_mappings:
+                by_id_mappings[partition] = []
+
+            by_id_mappings[partition].append("%s-part%s" % (by_id_basename, partitionNumber))
+
+
+    return(by_id_mappings)
+
+
+def pruneSymlinks(logger):
+    by_id_links = glob.glob('/dev/disk/by-id/*')
+    for by_id_link in by_id_links:
+        by_id_link_realpath = os.path.realpath(by_id_link)
+        if not os.path.exists(by_id_link_realpath):
+            logger.log('Symlink realpath does not exist: %s (%s)' % (by_id_link, by_id_link_realpath))
+            try:
+                cmd = []
+                if not isRoot():
+                    cmd.append('sudo')
+
+                cmd.extend(['rm', '-v', by_id_link])
+                removalResult = subprocess.run(cmd)
+            finally:
+                logger.log('Removed: %s (%s)' % (by_id_link, by_id_link_realpath))
+
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description="A script for creating /dev/disk/by-id paths for drives accessed over usb (which uses a fake serial)")
+
+    parser.add_argument(
+            '--debug',
+            action='store_true',
+            default=False,
+            help='Enable debug logging'
+            )
+
+    parser.add_argument(
+            '--install',
+            action='store_true',
+            default=False,
+            help='Install udev rules to call this script. Automatically detecting generic usb serials from the system logs.'
+            )
+
+    parser.add_argument(
+            '--path',
+            help='Path to device.'
+            )
+
+    parser.add_argument(
+            '--log-file',
+            default="%s/%s.log" % (_scriptRoot, _scriptName),
+            help='Specify an alternative log file path.'
+            )
+
+    parser.add_argument(
+            '--date-format',
+            default='%Y-%m-%d %H:%M:%S',
+            help='Specify a custom datetime format string.'
+            )
+
+    parser.add_argument(
+            '--silent',
+            action='store_true',
+            default=False,
+            help='When set write nothing to output, only log to file.'
+            )
+
+    parser.add_argument(
+            '--prefixes',
+            nargs='+',
+            default=['ata','nvme'],
+            help='/dev/disk/by-id prefixes to create, Space delimited. Defaults to making the common two: ata and nvme.'
+            )
+
+    args = parser.parse_args()
+
+    # Skip dating if we're not setting a dateformat
+    logger = Logger(logFile=args.log_file,
+                    dateFormat=args.date_format,
+                    dated=bool(args.date_format),
+                    silent=args.silent)
+
+    if args.install:
+        if not isRoot():
+            logger.log("Please run this as root when using --install.")
+            exit(1)
+
+        logger.log("Installing...")
+        install(logger)
+        exit()
+
+
+    if not args.path:
+        logger.log("Please provide a path argument with '--path /dev/sdX' to use this tool.")
+        exit(1)
+
+    try:
+        pathStat = os.stat(args.path)
+        if not stat.S_ISBLK(pathStat.st_mode):
+            logger.log("%s doesn't seem to be a device file. Exiting." % args.path)
+            exit(1)
+
+    except FileNotFoundError:
+        logger.log("%s doesn't seem to exist. Pruning stale symlinks and exiting." % args.path)
+        pruneSymlinks(logger)
+        exit(1)
+
+
+    mappings = evalDisk(args.path, logger, args.prefixes)
+
+    logger.log(mappings)
+
+    for mapping in mappings:
+        for by_id_path in mappings[mapping]:
+            by_id_path_full = '/dev/disk/by-id/%s' % by_id_path
+            if os.path.islink(by_id_path_full) and os.path.exists(os.readlink(by_id_path_full)):
+                logger.log("Symlinks for %s already exist and are valid. Skipping..." % by_id_path_full)
+                continue
+
+            try:
+                cmd = []
+                if not isRoot():
+                    cmd.append('sudo')
+
+                cmd.extend(['ln', '-s', mapping, by_id_path_full])
+                symlinkResult = subprocess.run(cmd)
+            finally:
+                logger.log("Linked: %s > %s" % (mapping, by_id_path_full))
+
+
+    logger.log('----------------------END')
+
+if __name__ == "__main__":
+    main()
