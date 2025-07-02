@@ -32,6 +32,57 @@ class Logger:
 def isRoot():
     return os.geteuid() == 0
 
+def smartctl(diskPath, debug=False):
+
+    modes = ['auto',
+            'sntjmicron',
+            'ata',
+            'scsi',
+            'nvme',
+            'sat',
+            'usbasm1352r',
+            'usbcypress',
+            'usbjmicron',
+            'usbprolific',
+            'usbsunplus',
+            'sntasmedia',
+            'sntrealtek',
+            'jmb39x',
+            'jms56x',
+            'areca',
+            '3ware',
+            'hpt',
+            'megaraid',
+            'aacraid',
+            'sssraid',
+            'cciss']
+
+    if not isRoot():
+        cmd = ['sudo']
+    else:
+        cmd = []
+
+    cmd.extend(['smartctl', '-a'])
+    cmd.append(diskPath)
+
+    for mode in modes:
+        cmdMode = cmd.copy()
+        cmdMode.extend(['-d', mode])
+        if debug:
+            print('\tTrying mode: %s on disk %s' % (mode, diskPath))
+
+        result = subprocess.run(cmdMode, stdout=subprocess.PIPE,stderr=subprocess.STDOUT) # Send stderr to stdout
+        #print(cmdMode)
+        #print(result.stdout.decode('utf-8'))
+        if result.returncode == 1:
+            continue # Try the next mode in the list
+        else:
+            print('Read %s with smartctl. Mode: %s' % (diskPath, mode))
+            return result
+
+    print('Failed to read %s with smartctl.' % diskPath)
+    return False
+
 def install(logger):
     genericSerials = ['00000000', '123456', 'ABCDEF']
 
@@ -138,7 +189,10 @@ def evalDisk(path, logger, prefixes):
 
     cmd.extend(['smartctl', '-a', path])
 
-    result         = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = smartctl(path)
+    if not result:
+        return False
+
     smartctlOutput = result.stdout.decode("utf-8").split('\n')
 
     model  = None
